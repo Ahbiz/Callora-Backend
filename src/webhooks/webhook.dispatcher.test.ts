@@ -1,6 +1,29 @@
-import { dispatchWebhook, dispatchToAll, resetWebhookDispatcherForTests, stopWebhookDispatching } from './webhook.dispatcher.js';
+import http from 'http';
+import { AddressInfo } from 'net';
+import {
+    dispatchWebhook,
+    dispatchToAll,
+    resetWebhookDispatcherForTests,
+    stopWebhookDispatching,
+    consumeCappedResponseBody,
+    MAX_WEBHOOK_RESPONSE_BYTES,
+} from './webhook.dispatcher.js';
 import { WebhookStore } from './webhook.store.js';
 import type { WebhookConfig, WebhookPayload } from './webhook.types.js';
+
+// Mock DNS lookup so URL validation resolves deterministically with fake timers
+// eslint-disable-next-line no-var
+var mockDnsLookup = jest.fn().mockImplementation(async (hostname: string) => {
+    if (hostname === '127.0.0.1' || hostname === 'localhost') {
+        return [{ address: '127.0.0.1', family: 4 }];
+    }
+    return [{ address: '93.184.216.34', family: 4 }];
+});
+
+jest.mock('dns/promises', () => {
+    const lookupFn = (...args: unknown[]) => mockDnsLookup(...args);
+    return { __esModule: true, default: { lookup: lookupFn }, lookup: lookupFn };
+});
 
 describe('Webhook Dispatcher', () => {
     let originalFetch: typeof global.fetch;
@@ -352,4 +375,206 @@ describe('Webhook Dispatcher', () => {
             expect(fetchMock).toHaveBeenCalledTimes(1);
         });
     });
+
+    describe('SSRF Protection & Redirect Refusal (Issue #1262)', () => {
+        let server: http.Server;
+        let serverUrl: string;
+        let receivedRequests: Array<{ method?: string; url?: string; headers: http.IncomingHttpHeaders }>;
+        let originalEnv: string | undefined;
+
+        beforeEach(async () => {
+            originalEnv = process.env.NODE_ENV;
+            jest.useRealTimers();
+            WebhookStore.clearFailedDeliveries();
+            receivedRequests = [];
+
+            await new Promise<void>((resolve) => {
+                server = http.createServer((req, res) => {
+                    receivedRequests.push({ method: req.method, url: req.url, headers: req.headers });
+
+                    if (req.url === '/redirect-metadata-302') {
+                        res.writeHead(302, { Location: 'http://169.254.169.254/latest/meta-data' });
+                        res.end('Redirecting to cloud metadata');
+                        return;
+                    }
+
+                    if (req.url === '/redirect-internal-301') {
+                        res.writeHead(301, { Location: 'http://127.0.0.1:8080/admin/secrets' });
+                        res.end('Redirecting to internal admin');
+                        return;
+                    }
+
+                    if (req.url === '/redirect-307') {
+                        res.writeHead(307, { Location: 'http://10.0.0.1/private' });
+                        res.end('Temporary redirect');
+                        return;
+                    }
+
+                    if (req.url === '/large-response') {
+                        res.writeHead(200, { 'Content-Type': 'text/plain' });
+                        const chunk = 'A'.repeat(16 * 1024);
+                        for (let i = 0; i < 16; i++) {
+                            res.write(chunk);
+                        }
+                        res.end();
+                        return;
+                    }
+
+                    if (req.url === '/success') {
+                        res.writeHead(200, { 'Content-Type': 'application/json' });
+                        res.end(JSON.stringify({ received: true }));
+                        return;
+                    }
+
+                    res.writeHead(404);
+                    res.end('Not found');
+                });
+
+                server.listen(0, '127.0.0.1', () => {
+                    const address = server.address() as AddressInfo;
+                    serverUrl = `http://127.0.0.1:${address.port}`;
+                    resolve();
+                });
+            });
+        });
+
+        afterEach(async () => {
+            process.env.NODE_ENV = originalEnv;
+            if (server) {
+                await new Promise<void>((resolve) => server.close(() => resolve()));
+            }
+        });
+
+        it('does not follow 302 redirect to an internal metadata address and records failure reason', async () => {
+            const redirectConfig: WebhookConfig = {
+                developerId: 'dev_ssrf_test',
+                url: `${serverUrl}/redirect-metadata-302`,
+                events: ['new_api_call'],
+                createdAt: new Date(),
+            };
+
+            await dispatchWebhook(redirectConfig, payload);
+
+            expect(receivedRequests.length).toBe(1);
+            expect(receivedRequests[0].url).toBe('/redirect-metadata-302');
+
+            const failures = WebhookStore.getRecentFailures();
+            const failure = failures.find((f) => f.url === redirectConfig.url);
+            expect(failure).toBeDefined();
+            expect(failure?.lastError).toContain('HTTP 302');
+            expect(failure?.lastError).toContain('http://169.254.169.254/latest/meta-data');
+            expect(failure?.lastError).toContain('redirects are not followed');
+        });
+
+        it('does not follow 301 redirect to internal service and records failure', async () => {
+            const redirectConfig: WebhookConfig = {
+                developerId: 'dev_ssrf_test',
+                url: `${serverUrl}/redirect-internal-301`,
+                events: ['new_api_call'],
+                createdAt: new Date(),
+            };
+
+            await dispatchWebhook(redirectConfig, payload);
+
+            expect(receivedRequests.length).toBe(1);
+            expect(receivedRequests[0].url).toBe('/redirect-internal-301');
+
+            const failures = WebhookStore.getRecentFailures();
+            const failure = failures.find((f) => f.url === redirectConfig.url);
+            expect(failure).toBeDefined();
+            expect(failure?.lastError).toContain('HTTP 301');
+            expect(failure?.lastError).toContain('redirects are not followed');
+        });
+
+        it('does not follow 307 temporary redirect', async () => {
+            const redirectConfig: WebhookConfig = {
+                developerId: 'dev_ssrf_test',
+                url: `${serverUrl}/redirect-307`,
+                events: ['new_api_call'],
+                createdAt: new Date(),
+            };
+
+            await dispatchWebhook(redirectConfig, payload);
+
+            expect(receivedRequests.length).toBe(1);
+            const failures = WebhookStore.getRecentFailures();
+            const failure = failures.find((f) => f.url === redirectConfig.url);
+            expect(failure).toBeDefined();
+            expect(failure?.lastError).toContain('HTTP 307');
+        });
+
+        it('delivers successfully to 200 OK endpoint on local server', async () => {
+            const successConfig: WebhookConfig = {
+                developerId: 'dev_ssrf_test',
+                url: `${serverUrl}/success`,
+                events: ['new_api_call'],
+                createdAt: new Date(),
+            };
+
+            await dispatchWebhook(successConfig, payload);
+
+            expect(receivedRequests.length).toBe(1);
+            expect(receivedRequests[0].url).toBe('/success');
+            const failures = WebhookStore.getRecentFailures();
+            expect(failures.find((f) => f.url === successConfig.url)).toBeUndefined();
+        });
+
+        it('caps response body reads to MAX_WEBHOOK_RESPONSE_BYTES (64 KB)', async () => {
+            const largeBodyConfig: WebhookConfig = {
+                developerId: 'dev_ssrf_test',
+                url: `${serverUrl}/large-response`,
+                events: ['new_api_call'],
+                createdAt: new Date(),
+            };
+
+            await dispatchWebhook(largeBodyConfig, payload);
+            expect(receivedRequests.length).toBe(1);
+
+            const response = await fetch(`${serverUrl}/large-response`);
+            const consumed = await consumeCappedResponseBody(response, MAX_WEBHOOK_RESPONSE_BYTES);
+            expect(Buffer.byteLength(consumed, 'utf8')).toBeLessThanOrEqual(MAX_WEBHOOK_RESPONSE_BYTES);
+        });
+
+        it('refuses dispatch at dispatch time when DNS resolves to private range', async () => {
+            process.env.NODE_ENV = 'production';
+
+            mockDnsLookup.mockResolvedValueOnce([
+                { address: '169.254.169.254', family: 4 },
+            ]);
+
+            const privateDnsConfig: WebhookConfig = {
+                developerId: 'dev_ssrf_test',
+                url: 'https://dynamic-rebind.example.com/webhook',
+                events: ['new_api_call'],
+                createdAt: new Date(),
+            };
+
+            await dispatchWebhook(privateDnsConfig, payload);
+
+            const failures = WebhookStore.getRecentFailures();
+            const failure = failures.find((f) => f.url === privateDnsConfig.url);
+            expect(failure).toBeDefined();
+            expect(failure?.lastError).toContain('resolves to a private/internal IP address (169.254.169.254)');
+            expect(failure?.attempts).toBe(0);
+        });
+
+        it('refuses dispatch at dispatch time when hostname DNS fails to resolve', async () => {
+            mockDnsLookup.mockRejectedValueOnce(new Error('getaddrinfo ENOTFOUND invalid.domain'));
+
+            const invalidDnsConfig: WebhookConfig = {
+                developerId: 'dev_ssrf_test',
+                url: 'https://invalid.domain/webhook',
+                events: ['new_api_call'],
+                createdAt: new Date(),
+            };
+
+            await dispatchWebhook(invalidDnsConfig, payload);
+
+            const failures = WebhookStore.getRecentFailures();
+            const failure = failures.find((f) => f.url === invalidDnsConfig.url);
+            expect(failure).toBeDefined();
+            expect(failure?.lastError).toContain('Could not resolve webhook hostname.');
+        });
+    });
 });
+
